@@ -9,6 +9,7 @@
 // standard stuff (might delete later haha)
 #include <time.h>
 #include <stdio.h>
+#include <string.h>
 #include <assert.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -26,6 +27,8 @@ typedef struct {
     size_t seq;
 } Data;
 
+#define data_create(d, s) ((Data){.date = (d), .seq = (s)})
+
 // a string to replace stinky c-strings
 typedef struct {
    char *data;
@@ -36,11 +39,11 @@ static Date date_now(void)
 {
     // this code will be platform dependent someday probably idk
     time_t t = time(NULL);
-    struct tm stm = *localtime(&t);
+    struct tm *lt = localtime(&t);
     return (Date){
-        .year = stm.tm_year + 1900,
-        .month = stm.tm_mon,
-        .day = stm.tm_mday,
+        .year = lt->tm_year + 1900,
+        .month = lt->tm_mon + 1,
+        .day = lt->tm_mday,
     };
 }
 
@@ -50,27 +53,34 @@ static Date date_now(void)
 #define string_is_empty(s) ((s).len == 0)
 
 #define RADIX 10
+#define GBUF_SIZE 0xFF
 
-static inline size_t count_digits(size_t value)
+// global data
+static char DATE_BUF[GBUF_SIZE];
+static char FILE_IN_BUF[GBUF_SIZE];
+static char FILE_OUT_BUF[GBUF_SIZE];
+
+static inline size_t max_decimal(size_t digits)
 {
-    size_t result = 0;
-    while (value > 0) {
-        value /= RADIX;
-        result += 1;
+    size_t result = 1;
+    while (digits-- > 0) {
+        result *= RADIX;
     }
 
-    return result;
+    return result - 1;
 }
 
-static inline size_t buf_fill_fmt(char *dst, char *src, char c, size_t value, bool truncate)
-{
+static inline size_t buf_fill_fmt(
+    char *dst, char *src, char c,
+    size_t value, bool saturate
+) {
     // get our length first
     size_t len = 0;
     while (*src++ == c) {
         len += 1;
     }
 
-    if (truncate && count_digits(value) > len) {
+    if (saturate && value > max_decimal(len)) {
         memset(dst, '9', len);
     } else {
         // dumb zero-padding
@@ -87,13 +97,10 @@ static inline size_t buf_fill_fmt(char *dst, char *src, char c, size_t value, bo
     return len;
 }
 
-#define DATE_BUF_SIZE 0xFF
-static char DATE_BUF[DATE_BUF_SIZE];
-
 static String string_from_fmt(String fmt, Data data)
 {
     // validate that our global buffer is large enough to fit the result
-    assert(fmt.len < DATE_BUF_SIZE);
+    assert(fmt.len < GBUF_SIZE);
 
     char *buf = DATE_BUF;
 
@@ -102,24 +109,23 @@ static String string_from_fmt(String fmt, Data data)
         char c = fmt.data[i];
         char *dst = &buf[i];
         char *src = &fmt.data[i];
-        size_t width;
+        size_t width = 1;
         switch (c) {
             case 'y':
-                width = buf_fill_fmt(dst, src, 'y', data.date.year, false);
+                width = buf_fill_fmt(dst, src, c, data.date.year, false);
                 break;
             case 'M':
-                width = buf_fill_fmt(dst, src, 'M', data.date.month, false);
+                width = buf_fill_fmt(dst, src, c, data.date.month, false);
                 break;
             case 'd':
-                width = buf_fill_fmt(dst, src, 'd', data.date.day, false);
+                width = buf_fill_fmt(dst, src, c, data.date.day, false);
                 break;
             case 'x':
-                width = buf_fill_fmt(dst, src, 'x', data.seq, true);
+                width = buf_fill_fmt(dst, src, c, data.seq, true);
                 break;
             default:
                 // passthru
-                buf[i] = fmt.data[i];
-                width = 1;
+                *dst = c;
                 break;
         }
 
@@ -151,16 +157,17 @@ static bool clipboard_set_string(String str)
 
     char *data = GlobalLock(handle);
     if (data == NULL) {
-        fprintf(stderr, "couldn't lock that global object smh\n");
+        fprintf(stderr, "couldn't lock dat movable memory smh\n");
         GlobalFree(handle);
         CloseClipboard();
         return false;
     }
 
-    memcpy(data, str.data, str.len + 1);
+    memcpy(data, str.data, str.len);
+    data[str.len] = '\0';
+
     GlobalUnlock(handle);
     SetClipboardData(CF_TEXT, handle);
-    GlobalFree(handle);
     CloseClipboard();
     return true;
 }
@@ -170,22 +177,23 @@ static bool clipboard_set_string(String str)
 static inline size_t get_and_increment_sequence(String contents, Date now)
 {
     Data data = {0};
+    size_t parsed = 0;
 
     // read in data if there is any
     if (!string_is_empty(contents)) {
-        sscanf(contents.data, DATA_FMT, &data.date.year, &data.date.month, &data.date.day, &data.seq);
+        parsed = sscanf(
+            contents.data, DATA_FMT,
+            &data.date.year, &data.date.month, &data.date.day, &data.seq
+        );
     }
 
-    // reset sequence if stored date isn't today
-    if (memcmp(&data.date, &now, sizeof(now)) != 0) {
+    // reset sequence if stored date isn't today (or the format's broken)
+    if (parsed != 4 || memcmp(&data.date, &now, sizeof(now)) != 0) {
         data.seq = 0;
     }
 
     return data.seq + 1;
 }
-
-#define FILE_IN_BUF_SIZE 0xFF
-static char FILE_IN_BUF[FILE_IN_BUF_SIZE];
 
 static String string_from_file_contents(String filename)
 {
@@ -194,20 +202,20 @@ static String string_from_file_contents(String filename)
 
     FILE *fp = fopen(filename.data, "rb");
     if (fp != NULL) {
-        len = fread(buf, 1, FILE_IN_BUF_SIZE, fp);
+        len = fread(buf, 1, GBUF_SIZE - 1, fp);
         fclose(fp);
     }
 
     return string_create(buf, len);
 }
 
-#define FILE_OUT_BUF_SIZE 0xFF
-static char FILE_OUT_BUF[FILE_OUT_BUF_SIZE];
-
 static String string_from_data(Data data)
 {
     char *buf = FILE_OUT_BUF;
-    size_t len = sprintf(buf, DATA_FMT, data.date.year, data.date.month, data.date.day, data.seq);
+    size_t len = snprintf(
+        buf, GBUF_SIZE, DATA_FMT,
+        data.date.year, data.date.month, data.date.day, data.seq
+    );
     return string_create(buf, len);
 }
 
@@ -241,12 +249,12 @@ static inline void file_write_string(String filename, String str)
  * ->           20260913012
  *
  * TODO: on windows the data file isn't hidden because we need to create it
- *       through CreateFile with the FILE_ATTRIBUTE_HIDDEN flag set
+ *       through CreateFile with the FILE_ATTRIBUTE_HIDDEN flag set (portability...)
  */
 int main(int argc, char *argv[])
 {
     // validate the input
-    if (argc != 2) {
+    if (argc != 2 || strlen(argv[1]) >= GBUF_SIZE) {
         fprintf(stderr, "usage: seq [fmt] (example: seq yyyyMMddxxx)\n");
         return 1;
     }
@@ -257,13 +265,13 @@ int main(int argc, char *argv[])
     // do our file and sequence bookkeeping
     String contents = string_from_file_contents(string_lit(DATA_FILE_NAME));
     size_t seq = get_and_increment_sequence(contents, now);
-    Data data = (Data){.date = now, .seq = seq};
+    Data data = data_create(now, seq);
     file_write_string(string_lit(DATA_FILE_NAME), string_from_data(data));
 
     // parse our format
     String fmt = string_from_cstring(argv[1]);
     String result = string_from_fmt(fmt, data);
-    printf("sequence: %.*s\n", (int)result.len, result.data);
+    printf("%.*s\n", (int)result.len, result.data);
 
     // copy the result to the clipboard
     return (int)clipboard_set_string(result);
