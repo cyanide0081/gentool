@@ -39,8 +39,7 @@ typedef struct {
 
 // https://www.rfc-editor.org/rfc/rfc9562.html#name-uuid-version-4
 typedef struct {
-    uint64_t hi;
-    uint64_t lo;
+    uint8_t data[16];
 } UUIDv4;
 
 // opaque for per-os definition
@@ -65,6 +64,8 @@ struct File {
 
 #define FILE_ACCESS_READ GENERIC_READ
 #define FILE_ACCESS_WRITE GENERIC_WRITE
+#define FILE_MODE_OPEN_ALWAYS OPEN_ALWAYS
+#define FILE_MODE_CREATE_ALWAYS CREATE_ALWAYS
 #define FILE_ATTR_HIDDEN FILE_ATTRIBUTE_HIDDEN
 
 static inline void ptf_get_entropy(void *buf, size_t bytes)
@@ -77,10 +78,10 @@ static inline bool ptf_file_is_valid(File file)
     return file.handle != INVALID_HANDLE_VALUE;
 }
 
-static inline File ptf_file_open(String filename, uint32_t access, uint32_t attr)
+static inline File ptf_file_open(String filename, uint32_t access, uint32_t mode, uint32_t attr)
 {
     File result = {
-        .handle = CreateFileA(filename.data, access, 0, NULL, OPEN_ALWAYS, attr, NULL),
+        .handle = CreateFileA(filename.data, access, 0, NULL, mode, attr, NULL),
     };
     return result;
 }
@@ -92,16 +93,16 @@ static inline void ptf_file_close(File file)
 
 static inline size_t ptf_file_read(File file, void *buf, size_t bytes)
 {
-    size_t read = 0;
-    ReadFile(file.handle, buf, bytes, (LPDWORD)&read, NULL);
-    return read;
+    DWORD read = 0;
+    ReadFile(file.handle, buf, bytes, &read, NULL);
+    return (size_t)read;
 }
 
 static inline size_t ptf_file_write(File file, void *buf, size_t bytes)
 {
-    size_t written = 0;
-    WriteFile(file.handle, buf, bytes, (LPDWORD)&written, NULL);
-    return written;
+    DWORD written = 0;
+    WriteFile(file.handle, buf, bytes, &written, NULL);
+    return (size_t)written;
 }
 
 static bool ptf_clipboard_set_string(String str)
@@ -133,9 +134,15 @@ static bool ptf_clipboard_set_string(String str)
 
     memcpy(data, str.data, str.len);
     data[str.len] = '\0'; // wow so explicit and safe
-
     GlobalUnlock(handle);
-    SetClipboardData(CF_TEXT, handle);
+
+    if (SetClipboardData(CF_TEXT, handle) == NULL) {
+        fprintf(stderr, "couldn't set dat clipboard data smh\n");
+        GlobalFree(handle);
+        CloseClipboard();
+        return false;
+    }
+
     CloseClipboard();
     return true;
 }
@@ -161,27 +168,23 @@ static Date date_now(void)
 
 static UUIDv4 uuidv4_random(void)
 {
-    UUIDv4 result = {0};
-    uint8_t buf[sizeof(result)];
-
-    ptf_get_entropy(buf, sizeof(buf)); // fill it all with random data
-    buf[7] = (buf[7] & 0x0F) | 0x4; // ver field (bits 48-51) -> 0100xxxx
-    buf[9] = (buf[9] & 0x3F) | 0x2; // var field (bits 64-65) -> 10xxxxxx
-
-    memcpy(&result, buf, sizeof(buf));
-    return result;
+    UUIDv4 id = {0};
+    ptf_get_entropy(id.data, sizeof(id.data)); // fill it all with random data
+    id.data[6] = (id.data[6] & 0x0F) | 0x40; // ver field (bits 48-51) -> 0100xxxx
+    id.data[8] = (id.data[8] & 0x3F) | 0x80; // var field (bits 64-65) -> 10xxxxxx
+    return id;
 }
 
 static String string_from_uuidv4(UUIDv4 id)
 {
     char *buf = UUID_BUF;
     size_t len = snprintf(
-        buf, UUID_BUF_SIZE, "%08llx-%04llx-%04llx-%04llx-%012llx",
-        (id.hi & 0xFFFFFFFF00000000ULL) >> 32,
-        (id.hi & 0x00000000FFFF0000ULL) >> 16,
-        (id.hi & 0x000000000000FFFFULL) >> 0,
-        (id.lo & 0xFFFF000000000000ULL) >> 48,
-        (id.lo & 0x0000FFFFFFFFFFFFULL) >> 0
+        buf, UUID_BUF_SIZE,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        id.data[0], id.data[1], id.data[2], id.data[3],
+        id.data[4], id.data[5], id.data[6], id.data[7],
+        id.data[8], id.data[9], id.data[10], id.data[11],
+        id.data[12], id.data[13], id.data[14], id.data[15]
     );
     return string_create(buf, len);
 }
@@ -289,7 +292,7 @@ static String string_from_file_contents(String filename)
     char *buf = FILE_IN_BUF;
     size_t len = 0;
 
-    File file = ptf_file_open(filename, FILE_ACCESS_READ, 0);
+    File file = ptf_file_open(filename, FILE_ACCESS_READ, FILE_MODE_OPEN_ALWAYS, 0);
     if (ptf_file_is_valid(file)) {
         len = ptf_file_read(file, buf, GBUF_SIZE - 1);
         ptf_file_close(file);
@@ -310,7 +313,7 @@ static String string_from_data(Data data)
 
 static inline void file_write_string(String filename, String str)
 {
-    File file = ptf_file_open(filename, FILE_ACCESS_WRITE, FILE_ATTR_HIDDEN);
+    File file = ptf_file_open(filename, FILE_ACCESS_WRITE, FILE_MODE_CREATE_ALWAYS, FILE_ATTR_HIDDEN);
     if (ptf_file_is_valid(file)) {
         ptf_file_write(file, str.data, str.len);
         ptf_file_close(file);
