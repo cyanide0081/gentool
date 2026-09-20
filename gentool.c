@@ -53,10 +53,6 @@ typedef struct File File;
 #define string_is_empty(s) ((s).len == 0)
 #define string_length(s) ((s).len)
 
-#define RADIX 10
-#define GBUF_SIZE 0xFF
-#define UUID_BUF_SIZE 37
-
 // NOTE: platform specific section (only windows for now)
 #if defined(PTF_WINDOWS)
 struct File {
@@ -149,11 +145,16 @@ static bool ptf_clipboard_set_string(String str)
 }
 #endif // PTF_WINDOWS
 
+#define GBUF_SIZE 0xFF
+#define UUID_BUF_SIZE 37
+#define CNPJ_BUF_SIZE 19
+
 // global data
 static char DATE_BUF[GBUF_SIZE];
 static char FILE_IN_BUF[GBUF_SIZE];
 static char FILE_OUT_BUF[GBUF_SIZE];
 static char UUID_BUF[UUID_BUF_SIZE];
+static char CNPJ_BUF[CNPJ_BUF_SIZE];
 
 static Date date_now(void)
 {
@@ -177,56 +178,6 @@ static inline size_t max_num(size_t digits, size_t radix)
     return result - 1;
 }
 
-static char SYMBOL_FROM_DIGIT[16] = {
-    '0', '1', '2', '3', '4', '5', '6', '7',
-    '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-};
-
-static inline void buf_fill_num(
-    char *buf, size_t ofs, size_t len,
-    uint64_t value, size_t radix, bool saturate
-) {
-    assert(radix <= sizeof(SYMBOL_FROM_DIGIT));
-    
-    char *dst = buf + ofs;
-    if (saturate && value > max_num(len, radix)) {
-        memset(dst, '9', len);
-    } else {
-        // fill out our number
-        for (size_t i = 0; i < len; i++) {
-            size_t digit = value % radix;
-            value /= radix;
-            dst[len - i - 1] = SYMBOL_FROM_DIGIT[digit];
-        }
-    }
-}
-
-static inline size_t buf_fill_fmt(
-    char *dst, char *src, char c,
-    size_t value, bool saturate
-) {
-    // get our length first
-    size_t len = 0;
-    while (*src++ == c) {
-        len += 1;
-    }
-
-    buf_fill_num(dst, 0, len, value, 10, saturate);
-    return len;
-}
-
-static UUIDv4 uuidv4_random(void)
-{
-    UUIDv4 id = {0};
-    uint8_t buf[sizeof(id)];
-
-    ptf_get_entropy(buf, sizeof(buf)); // fill it all with random data
-    buf[6] = (buf[6] & 0x0F) | 0x40; // ver field (bits 48-51) -> 0100xxxx
-    buf[8] = (buf[8] & 0x3F) | 0x80; // var field (bits 64-65) -> 10xxxxxx
-
-    memcpy(&id, buf, sizeof(id));
-    return id;
-}
 
 // could be resolved at compile-time but cba with all the macros
 static inline bool arch_is_little_endian(void)
@@ -252,6 +203,147 @@ static inline uint64_t num_to_big_endian(uint64_t value)
     return value;
 }
 
+#define SYMBOL_TABLE_SIZE 36
+
+static char SYMBOL_FROM_DIGIT_LOWER[SYMBOL_TABLE_SIZE] = {
+    '0', '1', '2', '3', '4', '5', '6', '7',
+    '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
+    'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    'w', 'x', 'y', 'z'
+};
+
+static char SYMBOL_FROM_DIGIT_UPPER[SYMBOL_TABLE_SIZE] = {
+    '0', '1', '2', '3', '4', '5', '6', '7',
+    '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
+    'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
+    'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V',
+    'W', 'X', 'Y', 'Z'
+};
+
+static inline void buf_fill_num(
+    char *buf, size_t ofs, size_t len,
+    uint64_t value, size_t radix,
+    bool upper, bool saturate
+) {
+    assert(radix <= SYMBOL_TABLE_SIZE);
+    
+    char *dst = buf + ofs;
+    char *table = upper ? SYMBOL_FROM_DIGIT_UPPER : SYMBOL_FROM_DIGIT_LOWER;
+    if (saturate && value > max_num(len, radix)) {
+        memset(dst, '9', len);
+    } else {
+        // fill out our number
+        for (size_t i = 0; i < len; i++) {
+            size_t digit = value % radix;
+            value /= radix;
+            dst[len - i - 1] = table[digit];
+        }
+    }
+}
+
+static inline void buf_fill_bytes(
+    char *dst, size_t dst_ofs,
+    uint8_t *src, size_t src_ofs,
+    size_t len, bool upper
+) {
+    char *table = upper ? SYMBOL_FROM_DIGIT_UPPER : SYMBOL_FROM_DIGIT_LOWER;
+    for (size_t i = 0; i < len; i++) {
+        dst[dst_ofs + i] = table[src[src_ofs + i]];
+    }
+}
+
+static inline size_t buf_fill_fmt(
+    char *dst, char *src, char c,
+    size_t value, bool upper, bool saturate
+) {
+    // get our length first
+    size_t len = 0;
+    while (*src++ == c) {
+        len += 1;
+    }
+
+    buf_fill_num(dst, 0, len, value, 10, upper, saturate);
+    return len;
+}
+
+static inline void buf_trunc_bytes(uint8_t *buf, size_t ofs, size_t len, size_t radix)
+{
+    for (size_t i = 0; i < len; i++) {
+        buf[ofs + i] %= radix;
+    }
+}
+
+static uint8_t CNPJ_WEIGHTS[13] = {2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5, 6};
+
+static inline uint8_t cnpj_mod11(uint8_t *digits, bool first)
+{
+    size_t sum = 0;
+    size_t count = first ? 12 : 13;
+    for (size_t i = 0; i < count; i++) {
+        sum += (digits[count - i - 1] * CNPJ_WEIGHTS[i]);
+    }
+
+    // TODO fix
+    printf("%zu\n", sum % 11);
+    return (uint8_t)sum % 11;
+}
+
+static String cnpj_random(void)
+{
+    char *buf = CNPJ_BUF;
+    uint8_t digits[14] = {0};
+
+    // fill separators
+    buf[2] = '.';
+    buf[6] = '.';
+    buf[10] = '/';
+    buf[15] = '-';
+
+    // get and truncate random digits
+    ptf_get_entropy(digits, 12);
+    digits[0] = 1;
+    digits[1] = 2;
+    digits[2] = 10;
+    digits[3] = 11;
+    digits[4] = 12;
+    digits[5] = 3;
+    digits[6] = 4;
+    digits[7] = 5;
+    digits[8] = 0;
+    digits[9] = 1;
+    digits[10] = 13;
+    digits[11] = 14;
+
+    buf_trunc_bytes(digits, 0, 12, 36);
+
+    // calc them check digits
+    digits[12] = cnpj_mod11(digits, true);
+    digits[13] = cnpj_mod11(digits, false);
+
+    // fill values
+    buf_fill_bytes(buf, 0,  digits, 0,  2, true);
+    buf_fill_bytes(buf, 3,  digits, 2,  3, true);
+    buf_fill_bytes(buf, 7,  digits, 5,  3, true);
+    buf_fill_bytes(buf, 11, digits, 8,  4, true);
+    buf_fill_bytes(buf, 16, digits, 12, 2, true);
+
+    return string_create(buf, 18);   
+}
+
+static UUIDv4 uuidv4_random(void)
+{
+    UUIDv4 id = {0};
+    uint8_t buf[sizeof(id)];
+
+    ptf_get_entropy(buf, sizeof(buf)); // fill it all with random data
+    buf[6] = (buf[6] & 0x0F) | 0x40; // ver field (bits 48-51) -> 0100xxxx
+    buf[8] = (buf[8] & 0x3F) | 0x80; // var field (bits 64-65) -> 10xxxxxx
+
+    memcpy(&id, buf, sizeof(id));
+    return id;
+}
+
 static String string_from_uuidv4(UUIDv4 id)
 {
     char *buf = UUID_BUF;
@@ -267,11 +359,11 @@ static String string_from_uuidv4(UUIDv4 id)
     uint64_t lo = num_to_big_endian(id.lo);
 
     // fill values
-    buf_fill_num(buf, 0,   8, (hi & 0xFFFFFFFF00000000ULL) >> 32, 16, false);
-    buf_fill_num(buf, 9,   4, (hi & 0x00000000FFFF0000ULL) >> 16, 16, false);
-    buf_fill_num(buf, 14,  4, (hi & 0x000000000000FFFFULL) >> 0,  16, false);
-    buf_fill_num(buf, 19,  4, (lo & 0xFFFF000000000000ULL) >> 48, 16, false);
-    buf_fill_num(buf, 24, 12, (lo & 0x0000FFFFFFFFFFFFULL) >> 0,  16, false);
+    buf_fill_num(buf, 0,   8, (hi & 0xFFFFFFFF00000000ULL) >> 32, 16, false, false);
+    buf_fill_num(buf, 9,   4, (hi & 0x00000000FFFF0000ULL) >> 16, 16, false, false);
+    buf_fill_num(buf, 14,  4, (hi & 0x000000000000FFFFULL) >> 0,  16, false, false);
+    buf_fill_num(buf, 19,  4, (lo & 0xFFFF000000000000ULL) >> 48, 16, false, false);
+    buf_fill_num(buf, 24, 12, (lo & 0x0000FFFFFFFFFFFFULL) >> 0,  16, false, false);
 
     return string_create(buf, 36);
 }
@@ -291,16 +383,16 @@ static String string_from_fmt(String fmt, Data data)
         size_t width = 1;
         switch (c) {
             case 'y':
-                width = buf_fill_fmt(dst, src, c, data.date.year, false);
+                width = buf_fill_fmt(dst, src, c, data.date.year, false, false);
                 break;
             case 'M':
-                width = buf_fill_fmt(dst, src, c, data.date.month, false);
+                width = buf_fill_fmt(dst, src, c, data.date.month, false, false);
                 break;
             case 'd':
-                width = buf_fill_fmt(dst, src, c, data.date.day, false);
+                width = buf_fill_fmt(dst, src, c, data.date.day, false, false);
                 break;
             case 'x':
-                width = buf_fill_fmt(dst, src, c, data.seq, true);
+                width = buf_fill_fmt(dst, src, c, data.seq, false, true);
                 break;
             default:
                 // passthru
@@ -373,6 +465,7 @@ static inline void file_write_string(String filename, String str)
 typedef enum {
     MODE_NONE,
     MODE_UUIDV4,
+    MODE_CNPJ,
     MODE_SEQ,
 } Mode;
 
@@ -383,6 +476,8 @@ static inline Mode mode_infer(int argc, char *argv[])
         String arg = string_from_cstring(argv[1]);
         if (argc >= 2 && string_equals(arg, string_lit("uuidv4"))) {
             mode = MODE_UUIDV4;
+        } else if (argc >= 2 && string_equals(arg, string_lit("cnpj"))) {
+            mode = MODE_CNPJ;
         } else if (argc >= 3 && string_equals(arg, string_lit("seq"))) {
             mode = MODE_SEQ;
         }
@@ -414,6 +509,9 @@ int main(int argc, char *argv[])
         case MODE_UUIDV4:
             // yup
             result = string_from_uuidv4(uuidv4_random());
+            break;
+        case MODE_CNPJ:
+            result = cnpj_random();
             break;
         case MODE_SEQ:
             // making sure it'll fit
