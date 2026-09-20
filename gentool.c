@@ -39,7 +39,8 @@ typedef struct {
 
 // https://www.rfc-editor.org/rfc/rfc9562.html#name-uuid-version-4
 typedef struct {
-    uint8_t data[16];
+    uint64_t hi;
+    uint64_t lo;
 } UUIDv4;
 
 // opaque for per-os definition
@@ -166,37 +167,38 @@ static Date date_now(void)
     };
 }
 
-static UUIDv4 uuidv4_random(void)
-{
-    UUIDv4 id = {0};
-    ptf_get_entropy(id.data, sizeof(id.data)); // fill it all with random data
-    id.data[6] = (id.data[6] & 0x0F) | 0x40; // ver field (bits 48-51) -> 0100xxxx
-    id.data[8] = (id.data[8] & 0x3F) | 0x80; // var field (bits 64-65) -> 10xxxxxx
-    return id;
-}
-
-static String string_from_uuidv4(UUIDv4 id)
-{
-    char *buf = UUID_BUF;
-    size_t len = snprintf(
-        buf, UUID_BUF_SIZE,
-        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-        id.data[0], id.data[1], id.data[2], id.data[3],
-        id.data[4], id.data[5], id.data[6], id.data[7],
-        id.data[8], id.data[9], id.data[10], id.data[11],
-        id.data[12], id.data[13], id.data[14], id.data[15]
-    );
-    return string_create(buf, len);
-}
-
-static inline size_t max_decimal(size_t digits)
+static inline size_t max_num(size_t digits, size_t radix)
 {
     size_t result = 1;
     while (digits-- > 0) {
-        result *= RADIX;
+        result *= radix;
     }
 
     return result - 1;
+}
+
+static char SYMBOL_FROM_DIGIT[16] = {
+    '0', '1', '2', '3', '4', '5', '6', '7',
+    '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+};
+
+static inline void buf_fill_num(
+    char *buf, size_t ofs, size_t len,
+    uint64_t value, size_t radix, bool saturate
+) {
+    assert(radix <= sizeof(SYMBOL_FROM_DIGIT));
+    
+    char *dst = buf + ofs;
+    if (saturate && value > max_num(len, radix)) {
+        memset(dst, '9', len);
+    } else {
+        // fill out our number
+        for (size_t i = 0; i < len; i++) {
+            size_t digit = value % radix;
+            value /= radix;
+            dst[len - i - 1] = SYMBOL_FROM_DIGIT[digit];
+        }
+    }
 }
 
 static inline size_t buf_fill_fmt(
@@ -209,21 +211,69 @@ static inline size_t buf_fill_fmt(
         len += 1;
     }
 
-    if (saturate && value > max_decimal(len)) {
-        memset(dst, '9', len);
-    } else {
-        // dumb zero-padding
-        memset(dst, '0', len);
+    buf_fill_num(dst, 0, len, value, 10, saturate);
+    return len;
+}
 
-        // fill out our number
-        for (size_t i = 0; i < len; i++) {
-            size_t digit = value % RADIX;
-            value /= RADIX;
-            dst[len - i - 1] = digit + '0';
-        }
+static UUIDv4 uuidv4_random(void)
+{
+    UUIDv4 id = {0};
+    uint8_t buf[sizeof(id)];
+
+    ptf_get_entropy(buf, sizeof(buf)); // fill it all with random data
+    buf[6] = (buf[6] & 0x0F) | 0x40; // ver field (bits 48-51) -> 0100xxxx
+    buf[8] = (buf[8] & 0x3F) | 0x80; // var field (bits 64-65) -> 10xxxxxx
+
+    memcpy(&id, buf, sizeof(id));
+    return id;
+}
+
+// could be resolved at compile-time but cba with all the macros
+static inline bool arch_is_little_endian(void)
+{
+    size_t val = 1;
+    return *((char*)&val) == 1; // if BE the 1-byte will be cut off
+}
+
+static inline uint64_t num_to_big_endian(uint64_t value)
+{
+    if (arch_is_little_endian()) {
+        value =
+            ((value & 0x00000000000000FFULL) << 56) |
+            ((value & 0xFF00000000000000ULL) >> 56) |
+            ((value & 0x000000000000FF00ULL) << 40) |
+            ((value & 0x00FF000000000000ULL) >> 40) |
+            ((value & 0x0000000000FF0000ULL) << 24) |
+            ((value & 0x0000FF0000000000ULL) >> 24) |
+            ((value & 0x00000000FF000000ULL) <<  8) |
+            ((value & 0x000000FF00000000ULL) >>  8);
     }
 
-    return len;
+    return value;
+}
+
+static String string_from_uuidv4(UUIDv4 id)
+{
+    char *buf = UUID_BUF;
+
+    // fill them dashes
+    buf[8] = '-';
+    buf[13] = '-';
+    buf[18] = '-';
+    buf[23] = '-';
+
+    // force conversion to BE
+    uint64_t hi = num_to_big_endian(id.hi);
+    uint64_t lo = num_to_big_endian(id.lo);
+
+    // fill values
+    buf_fill_num(buf, 0,   8, (hi & 0xFFFFFFFF00000000ULL) >> 32, 16, false);
+    buf_fill_num(buf, 9,   4, (hi & 0x00000000FFFF0000ULL) >> 16, 16, false);
+    buf_fill_num(buf, 14,  4, (hi & 0x000000000000FFFFULL) >> 0,  16, false);
+    buf_fill_num(buf, 19,  4, (lo & 0xFFFF000000000000ULL) >> 48, 16, false);
+    buf_fill_num(buf, 24, 12, (lo & 0x0000FFFFFFFFFFFFULL) >> 0,  16, false);
+
+    return string_create(buf, 36);
 }
 
 static String string_from_fmt(String fmt, Data data)
