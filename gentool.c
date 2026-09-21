@@ -178,7 +178,6 @@ static inline size_t max_num(size_t digits, size_t radix)
     return result - 1;
 }
 
-
 // could be resolved at compile-time but cba with all the macros
 static inline bool arch_is_little_endian(void)
 {
@@ -227,7 +226,7 @@ static inline void buf_fill_num(
     bool upper, bool saturate
 ) {
     assert(radix <= SYMBOL_TABLE_SIZE);
-    
+
     char *dst = buf + ofs;
     char *table = upper ? SYMBOL_FROM_DIGIT_UPPER : SYMBOL_FROM_DIGIT_LOWER;
     if (saturate && value > max_num(len, radix)) {
@@ -276,23 +275,24 @@ static inline void buf_trunc_bytes(uint8_t *buf, size_t ofs, size_t len, size_t 
 
 static uint8_t CNPJ_WEIGHTS[13] = {2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5, 6};
 
-static inline uint8_t cnpj_mod11(uint8_t *digits, bool first)
+static inline uint8_t cnpj_mod11(uint8_t *digits, size_t ctr)
 {
     size_t sum = 0;
-    size_t count = first ? 12 : 13;
+    size_t count = 12 + ctr;
     for (size_t i = 0; i < count; i++) {
-        sum += (digits[count - i - 1] * CNPJ_WEIGHTS[i]);
+        uint8_t digit = SYMBOL_FROM_DIGIT_UPPER[digits[i]] - '0';
+        sum += (digit * CNPJ_WEIGHTS[count - i - 1]);
     }
 
-    // TODO fix
-    printf("%zu\n", sum % 11);
-    return (uint8_t)sum % 11;
+    uint8_t rem = (uint8_t)(sum % 11);
+    return rem <= 1 ? 0 : 11 - rem;
 }
 
-static String cnpj_random(void)
+static String cnpj_random(bool alpha)
 {
     char *buf = CNPJ_BUF;
     uint8_t digits[14] = {0};
+    size_t radix = alpha ? 36 : 10;
 
     // fill separators
     buf[2] = '.';
@@ -302,24 +302,11 @@ static String cnpj_random(void)
 
     // get and truncate random digits
     ptf_get_entropy(digits, 12);
-    digits[0] = 1;
-    digits[1] = 2;
-    digits[2] = 10;
-    digits[3] = 11;
-    digits[4] = 12;
-    digits[5] = 3;
-    digits[6] = 4;
-    digits[7] = 5;
-    digits[8] = 0;
-    digits[9] = 1;
-    digits[10] = 13;
-    digits[11] = 14;
-
-    buf_trunc_bytes(digits, 0, 12, 36);
+    buf_trunc_bytes(digits, 0, 12, radix);
 
     // calc them check digits
-    digits[12] = cnpj_mod11(digits, true);
-    digits[13] = cnpj_mod11(digits, false);
+    digits[12] = cnpj_mod11(digits, 0);
+    digits[13] = cnpj_mod11(digits, 1);
 
     // fill values
     buf_fill_bytes(buf, 0,  digits, 0,  2, true);
@@ -328,7 +315,7 @@ static String cnpj_random(void)
     buf_fill_bytes(buf, 11, digits, 8,  4, true);
     buf_fill_bytes(buf, 16, digits, 12, 2, true);
 
-    return string_create(buf, 18);   
+    return string_create(buf, 18);
 }
 
 static UUIDv4 uuidv4_random(void)
@@ -493,6 +480,9 @@ static inline Mode mode_infer(int argc, char *argv[])
     "    modes:\n" \
     "        uuidv4   generates a pseudorandom UUIDv4\n" \
     "                 (example: gentool uuidv4)\n" \
+    "        cnpj     generates a CNPJ with an optional argument (alpha) \n" \
+    "                 to generate alphanumeric CNPJs\n" \
+    "                 (example: gentool cnpj alpha)\n" \
     "        seq      generates a date-based sequence with daily reset\n" \
     "                 and format specifiers [y(year), M(month), d(day), x(sequence)]\n" \
     "                 (example: gentool seq yyyyMMddxxx)\n" \
@@ -511,7 +501,9 @@ int main(int argc, char *argv[])
             result = string_from_uuidv4(uuidv4_random());
             break;
         case MODE_CNPJ:
-            result = cnpj_random();
+            bool alpha = argc >= 3 &&
+                string_equals(string_from_cstring(argv[2]), string_lit("alpha"));
+            result = cnpj_random(alpha);
             break;
         case MODE_SEQ:
             // making sure it'll fit
