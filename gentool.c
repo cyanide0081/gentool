@@ -1,11 +1,14 @@
 // win32 api ;D
 #if defined(_WIN64)
 #    define PTF_WINDOWS
+#    define WIN32_LEAN_AND_MEAN
 #    define _CRT_SECURE_NO_WARNINGS
 #    include <windows.h>
 #    include <bcrypt.h>
 #else
-#    error "No 64-bit windows? o_o"
+#    include <fcntl.h>
+#    include <unistd.h>
+#    include <X11/Xlib.h>
 #endif
 
 // standard stuff (might delete later haha)
@@ -52,6 +55,9 @@ typedef struct File File;
 #define string_equals(a, b) ((a).len == (b).len && memcmp((a).data, (b).data, (a).len) == 0)
 #define string_is_empty(s) ((s).len == 0)
 #define string_length(s) ((s).len)
+
+#define ceil(a, b)  ((a) > (b) ? (a) : (b))
+#define floor(a, b) ((a) < (b) ? (a) : (b))
 
 // NOTE: platform specific section (only windows for now)
 #if defined(PTF_WINDOWS)
@@ -143,6 +149,132 @@ static bool ptf_clipboard_set_string(String str)
     CloseClipboard();
     return true;
 }
+#else // assume POSIX
+struct File {
+    int descriptor;
+};
+
+#define FILE_ACCESS_READ O_RDONLY
+#define FILE_ACCESS_WRITE O_WRONLY
+#define FILE_MODE_OPEN_ALWAYS 0
+#define FILE_MODE_CREATE_ALWAYS O_CREAT
+#define FILE_ATTR_HIDDEN 0
+
+static inline void ptf_get_entropy(void *buf, size_t bytes)
+{
+    getentropy(buf, bytes);
+}
+
+static inline bool ptf_file_is_valid(File file)
+{
+    return file.descriptor != -1;
+}
+
+static inline File ptf_file_open(String filename, uint32_t access, uint32_t mode, uint32_t attr)
+{
+    File result = {
+        .descriptor = open(filename.data, access | attr | mode),
+    };
+    return result;
+}
+
+static inline void ptf_file_close(File file)
+{
+    close(file.descriptor);
+}
+
+static inline size_t ptf_file_read(File file, void *buf, size_t bytes)
+{
+    ssize_t read_ = read(file.descriptor, buf, bytes);
+    return (size_t)floor(read_, 0);
+}
+
+static inline size_t ptf_file_write(File file, void *buf, size_t bytes)
+{
+    ssize_t written = write(file.descriptor, buf, bytes);
+    return floor(written, 0);
+}
+
+static void ptf_x11_send_utf8(Display *d,
+                              XSelectionRequestEvent *serv,
+                              String str,
+                              Atom utf8,
+                              bool deny)
+{
+    if (!deny) {
+        // fill requestor's property with our data
+        printf("changing property\n");
+        XChangeProperty(d, serv->requestor, serv->property,
+                        utf8, 8, PropModeReplace,
+                        (unsigned char *)str.data, str.len);
+    }
+
+    XSelectionEvent sev = {
+        .type = SelectionNotify,
+        .requestor = serv->requestor,
+        .selection = serv->selection,
+        .target = serv->target,
+        .property = deny ? None : serv->property,
+        .time = serv->time,
+    };
+
+    // send our completion signal
+    XSendEvent(d, serv->requestor, True, NoEventMask, (XEvent*)&sev);
+}
+
+static bool ptf_x11_clipboard_set_string(String str)
+{
+    Display *d = XOpenDisplay(NULL);
+    if (d == NULL) {
+        fprintf(stderr, "couldn't open dat display\n");
+        return false;
+    }
+
+    int screen = DefaultScreen(d);
+    Window root = RootWindow(d, screen);
+
+    // create our window to receive messages from other clients
+    Window owner = XCreateSimpleWindow(d, root, -10, -10, 1, 1, 0, 0, 0);
+
+    // intern our clipboard and content type atoms
+    Atom sel = XInternAtom(d, "CLIPBOARD", False);
+    Atom utf8 = XInternAtom(d, "UTF8_STRING", False);
+
+    // claim ownership of our clipboard
+    XSetSelectionOwner(d, sel, owner, CurrentTime);
+
+    // listen to them events
+    XEvent event;
+    XSelectionRequestEvent *serv;
+    for (;;) {
+        XNextEvent(d, &event);
+        switch (event.type) {
+            case SelectionClear: {
+                // ownership lost, we bail
+                goto end;
+            } break;
+            case SelectionRequest: {
+                // someone's asking for our data
+                serv = (XSelectionRequestEvent*)&event.xselectionrequest;
+                bool deny = serv->target != utf8 || serv->property == None;
+                ptf_x11_send_utf8(d, serv, str, utf8, deny);
+            } break;
+        }
+    }
+
+end:
+    return true;
+}
+
+static bool ptf_clipboard_set_string(String str)
+{
+    // TODO(cya): figure out if we got X11 via getenv()
+    if (1) {
+        // TODO(cya): fork ourselves before setting up the daemon
+        return ptf_x11_clipboard_set_string(str);
+    }
+}
+
 #endif // PTF_WINDOWS
 
 #define GBUF_SIZE 0xFF
@@ -185,7 +317,7 @@ static inline bool arch_is_little_endian(void)
     return *((char*)&val) == 1; // if BE the 1-byte will be cut off
 }
 
-static inline uint64_t num_to_big_endian(uint64_t value)
+static inline uint64_t num_from_big_endian(uint64_t value)
 {
     if (arch_is_little_endian()) {
         value =
@@ -342,8 +474,8 @@ static String string_from_uuidv4(UUIDv4 id)
     buf[23] = '-';
 
     // force conversion to BE
-    uint64_t hi = num_to_big_endian(id.hi);
-    uint64_t lo = num_to_big_endian(id.lo);
+    uint64_t hi = num_from_big_endian(id.hi);
+    uint64_t lo = num_from_big_endian(id.lo);
 
     // fill values
     buf_fill_num(buf, 0,   8, (hi & 0xFFFFFFFF00000000ULL) >> 32, 16, false, false);
@@ -492,6 +624,8 @@ int main(int argc, char *argv[])
     // we need at least a mode
     Mode mode = mode_infer(argc, argv);
     String result = {0};
+    String fmt;
+    bool alpha;
     switch (mode) {
         case MODE_NONE:
             fprintf(stderr, USAGE);
@@ -501,13 +635,13 @@ int main(int argc, char *argv[])
             result = string_from_uuidv4(uuidv4_random());
             break;
         case MODE_CNPJ:
-            bool alpha = argc >= 3 &&
+            alpha = argc >= 3 &&
                 string_equals(string_from_cstring(argv[2]), string_lit("alpha"));
             result = cnpj_random(alpha);
             break;
         case MODE_SEQ:
             // making sure it'll fit
-            String fmt = string_from_cstring(argv[2]);
+            fmt = string_from_cstring(argv[2]);
             if (string_length(fmt) >= GBUF_SIZE) {
                 fprintf(stderr, "format string too large (%zu bytes)\n", fmt.len);
                 return 1;
