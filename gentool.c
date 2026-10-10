@@ -17,6 +17,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdbool.h>
 
 // a date without a time (wow)
@@ -51,7 +52,7 @@ typedef struct File File;
 
 #define string_lit(l) ((String){.data = (l), .len = sizeof(l) - 1})
 #define string_create(s, l) ((String){.data = (s), .len = (size_t)(l)})
-#define string_from_cstring(s) ((String){.data = (s), .len = strlen(s)})
+#define string_from_cstring(s) ((String){.data = (s), .len = (s) == NULL ? 0 : strlen(s)})
 #define string_equals(a, b) ((a).len == (b).len && memcmp((a).data, (b).data, (a).len) == 0)
 #define string_is_empty(s) ((s).len == 0)
 #define string_length(s) ((s).len)
@@ -195,18 +196,26 @@ static inline size_t ptf_file_write(File file, void *buf, size_t bytes)
     return floor(written, 0);
 }
 
-static void ptf_x11_send_utf8(Display *d,
-                              XSelectionRequestEvent *serv,
-                              String str,
-                              Atom utf8,
-                              bool deny)
+static bool ptf_wayland_clipboard_set_string(String str)
 {
+    // TODO(cya): implement
+    return !string_is_empty(str);
+}
+
+static void ptf_x11_send_text(
+    Display *d,
+    XSelectionRequestEvent *serv,
+    String str,
+    Atom format,
+    bool deny
+) {
     if (!deny) {
         // fill requestor's property with our data
-        printf("changing property\n");
-        XChangeProperty(d, serv->requestor, serv->property,
-                        utf8, 8, PropModeReplace,
-                        (unsigned char *)str.data, str.len);
+        XChangeProperty(
+            d, serv->requestor, serv->property,
+            format, 8, PropModeReplace,
+            (unsigned char *)str.data, (int)str.len
+        );
     }
 
     XSelectionEvent sev = {
@@ -219,7 +228,7 @@ static void ptf_x11_send_utf8(Display *d,
     };
 
     // send our completion signal
-    XSendEvent(d, serv->requestor, True, NoEventMask, (XEvent*)&sev);
+    XSendEvent(d, serv->requestor, True, NoEventMask, (XEvent *)&sev);
 }
 
 static bool ptf_x11_clipboard_set_string(String str)
@@ -238,7 +247,7 @@ static bool ptf_x11_clipboard_set_string(String str)
 
     // intern our clipboard and content type atoms
     Atom sel = XInternAtom(d, "CLIPBOARD", False);
-    Atom utf8 = XInternAtom(d, "UTF8_STRING", False);
+    Atom format = XInternAtom(d, "STRING", False);
 
     // claim ownership of our clipboard
     XSetSelectionOwner(d, sel, owner, CurrentTime);
@@ -255,9 +264,9 @@ static bool ptf_x11_clipboard_set_string(String str)
             } break;
             case SelectionRequest: {
                 // someone's asking for our data
-                serv = (XSelectionRequestEvent*)&event.xselectionrequest;
-                bool deny = serv->target != utf8 || serv->property == None;
-                ptf_x11_send_utf8(d, serv, str, utf8, deny);
+                serv = (XSelectionRequestEvent *)&event.xselectionrequest;
+                bool deny = serv->target != format || serv->property == None;
+                ptf_x11_send_text(d, serv, str, format, deny);
             } break;
         }
     }
@@ -266,12 +275,33 @@ end:
     return true;
 }
 
+static inline String ptf_get_env(String key)
+{
+    return string_from_cstring(getenv(key.data));
+}
+
+static inline void ptf_process_run_as_daemon(void)
+{
+    pid_t pid = fork();
+    if (pid != 0) {
+        // kill the parent
+        exit(0);
+    }
+}
+
 static bool ptf_clipboard_set_string(String str)
 {
-    // TODO(cya): figure out if we got X11 via getenv()
-    if (1) {
-        // TODO(cya): fork ourselves before setting up the daemon
+    if (!string_is_empty(ptf_get_env(string_lit("WAYLAND_DISPLAY")))) {
+        // wayland path
+        ptf_process_run_as_daemon();
+        return ptf_wayland_clipboard_set_string(str);
+    } else if (!string_is_empty(ptf_get_env(string_lit("DISPLAY")))) {
+        // x11 path
+        ptf_process_run_as_daemon();
         return ptf_x11_clipboard_set_string(str);
+    } else {
+        // tty path (no clipboard)
+        return true;
     }
 }
 
@@ -314,7 +344,7 @@ static inline size_t max_num(size_t digits, size_t radix)
 static inline bool arch_is_little_endian(void)
 {
     size_t val = 1;
-    return *((char*)&val) == 1; // if BE the 1-byte will be cut off
+    return *((char *)&val) == 1; // if BE the 1-byte will be cut off
 }
 
 static inline uint64_t num_from_big_endian(uint64_t value)
