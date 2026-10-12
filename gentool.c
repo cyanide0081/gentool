@@ -41,11 +41,11 @@ typedef struct {
    size_t len;
 } String;
 
-// https://www.rfc-editor.org/rfc/rfc9562.html#name-uuid-version-4
+// https://www.rfc-editor.org/rfc/rfc9562.html
 typedef struct {
     uint64_t hi;
     uint64_t lo;
-} UUIDv4;
+} UUID;
 
 // opaque for per-os definition
 typedef struct File File;
@@ -457,8 +457,8 @@ static String cnpj_random(bool alpha)
     size_t radix = alpha ? 36 : 10;
 
     // fill separators
-    buf[2] = '.';
-    buf[6] = '.';
+    buf[2]  = '.';
+    buf[6]  = '.';
     buf[10] = '/';
     buf[15] = '-';
 
@@ -480,9 +480,9 @@ static String cnpj_random(bool alpha)
     return string_create(buf, 18);
 }
 
-static UUIDv4 uuidv4_random(void)
+static UUID uuid_random(void)
 {
-    UUIDv4 id = {0};
+    UUID id;
     uint8_t buf[sizeof(id)];
 
     ptf_get_entropy(buf, sizeof(buf)); // fill it all with random data
@@ -493,17 +493,17 @@ static UUIDv4 uuidv4_random(void)
     return id;
 }
 
-static String string_from_uuidv4(UUIDv4 id)
+static String string_from_uuid(UUID id)
 {
     char *buf = UUID_BUF;
 
     // fill them dashes
-    buf[8] = '-';
+    buf[8]  = '-';
     buf[13] = '-';
     buf[18] = '-';
     buf[23] = '-';
 
-    // force conversion to BE
+    // force conversion from BE in case we're in LE territory
     uint64_t hi = num_from_big_endian(id.hi);
     uint64_t lo = num_from_big_endian(id.lo);
 
@@ -640,7 +640,7 @@ static inline Mode mode_infer(int argc, char *argv[])
     "generates data and copies it to the system clipboard\n" \
     "usage: gentool mode [args]\n" \
     "    modes:\n" \
-    "        uuidv4   generates a pseudorandom UUIDv4\n" \
+    "        uuidv4   generates a pseudorandom UUID\n" \
     "                 (example: gentool uuidv4)\n" \
     "        cnpj     generates a CNPJ with an optional argument (alpha) \n" \
     "                 to generate alphanumeric CNPJs\n" \
@@ -662,7 +662,7 @@ int main(int argc, char *argv[])
             return 1;
         case MODE_UUIDV4:
             // yup
-            result = string_from_uuidv4(uuidv4_random());
+            result = string_from_uuid(uuid_random());
             break;
         case MODE_CNPJ:
             alpha = argc >= 3 &&
